@@ -147,6 +147,84 @@ describe('Permit2 treasury boundary', () => {
 });
 
 describe('InflowClient.createPaymentPayload — InFlow branch', () => {
+  it('runs the before-payment hook and aborts before creating an InFlow transaction', async () => {
+    installSupported();
+    let transactionCreates = 0;
+    server.use(
+      http.post(`${PROD_BASE}/v1/transactions/x402`, () => {
+        transactionCreates += 1;
+        return HttpResponse.json({ approvalId: 'apr_1', approvalStatus: 'APPROVED', transactionId: 'tx_1' });
+      }),
+    );
+    const client = await createInflowClient({ apiKey: 'sk_test' });
+    const hook = vi.fn(() => Promise.resolve({ abort: true as const, reason: 'owner policy blocked this payment' }));
+    client.onBeforePaymentCreation(hook);
+
+    await expect(client.createPaymentPayload(paymentRequired([INFLOW_REQ]))).rejects.toThrow(
+      'Payment creation aborted: owner policy blocked this payment',
+    );
+    expect(hook).toHaveBeenCalledWith({
+      paymentRequired: paymentRequired([INFLOW_REQ]),
+      selectedRequirements: INFLOW_REQ,
+    });
+    expect(transactionCreates).toBe(0);
+  });
+
+  it('runs after-payment hooks for an InFlow-signed payload', async () => {
+    installSupported();
+    const payload = makeInflowPayload();
+    server.use(
+      http.post(`${PROD_BASE}/v1/transactions/x402`, () =>
+        HttpResponse.json({ approvalId: 'apr_1', approvalStatus: 'APPROVED', transactionId: 'tx_1' }),
+      ),
+      http.get(`${PROD_BASE}/v1/transactions/tx_1/x402`, () =>
+        HttpResponse.json({ status: 'SETTLED', encodedPayload: encodedFor(payload), paymentPayload: payload }),
+      ),
+    );
+    const client = await createInflowClient({ apiKey: 'sk_test' });
+    const hook = vi.fn(() => Promise.resolve());
+    client.onAfterPaymentCreation(hook);
+
+    await client.createPaymentPayload(paymentRequired([INFLOW_REQ]));
+
+    expect(hook).toHaveBeenCalledWith({
+      paymentRequired: paymentRequired([INFLOW_REQ]),
+      selectedRequirements: INFLOW_REQ,
+      paymentPayload: payload,
+    });
+  });
+
+  it('lets a payment-creation failure hook recover the InFlow signing path', async () => {
+    installSupported();
+    const required = paymentRequired([INFLOW_REQ]);
+    const accepted = required.accepts[0];
+    if (accepted === undefined) throw new Error('Missing accepted requirement fixture');
+    const recoveredPayload: PaymentPayload = {
+      x402Version: 2,
+      resource: { url: 'https://example.com/api/widgets', description: 'List' },
+      accepted,
+      payload: { transactionId: 'recovered' },
+    };
+    server.use(
+      http.post(`${PROD_BASE}/v1/transactions/x402`, () =>
+        HttpResponse.json({ approvalId: 'apr_1', approvalStatus: 'PENDING', transactionId: 'tx_1' }),
+      ),
+      http.get(`${PROD_BASE}/v1/transactions/tx_1/x402`, () => HttpResponse.json({ status: 'DECLINED' })),
+      http.post(`${PROD_BASE}/v1/approvals/apr_1/cancel`, () => new HttpResponse(null, { status: 204 })),
+    );
+    const client = await createInflowClient({ apiKey: 'sk_test' });
+    const hook = vi.fn(() => Promise.resolve({ recovered: true as const, payload: recoveredPayload }));
+    client.onPaymentCreationFailure(hook);
+
+    await expect(client.createPaymentPayload(required)).resolves.toBe(recoveredPayload);
+    expect(hook).toHaveBeenCalledOnce();
+    expect(hook.mock.calls[0]?.[0]).toMatchObject({
+      paymentRequired: required,
+      selectedRequirements: INFLOW_REQ,
+      error: expect.any(X402ApprovalFailedError),
+    });
+  });
+
   it('routes a supported requirement through the InFlow signer and returns the parsed paymentPayload', async () => {
     installSupported();
     const payload = makeInflowPayload();
