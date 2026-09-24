@@ -47,6 +47,9 @@ export class InflowClient extends x402Client {
    * override.
    */
   private readonly preferOrder: readonly PaymentScheme[];
+  private readonly inflowBeforePaymentCreationHooks: BeforePaymentCreationHook[] = [];
+  private readonly inflowAfterPaymentCreationHooks: AfterPaymentCreationHook[] = [];
+  private readonly inflowPaymentCreationFailureHooks: OnPaymentCreationFailureHook[] = [];
 
   /**
    * Construct via {@link createInflowClient}. The factory primes the buyer capability cache before resolving, so the
@@ -72,13 +75,38 @@ export class InflowClient extends x402Client {
     // why these casts are safe under the V2 wire shape.
     const inflowMatch = await this.pickInflowMatchBalanceAware(fromFoundationRequirements(paymentRequired.accepts));
     if (inflowMatch !== null) {
+      const selectedRequirements = paymentRequired.accepts.find((requirement) => requirement === inflowMatch);
+      if (selectedRequirements === undefined) {
+        throw new Error('InflowClient: selected requirement was not present in PaymentRequired.accepts');
+      }
+      const hookContext = { paymentRequired, selectedRequirements };
+      for (const hook of this.inflowBeforePaymentCreationHooks) {
+        const result = await hook(hookContext);
+        if (result && 'abort' in result && result.abort) {
+          throw new Error(`Payment creation aborted: ${result.reason}`);
+        }
+      }
       const context: SigningContext = {
         resource: paymentRequired.resource,
         x402Version: paymentRequired.x402Version,
         ...(paymentRequired.extensions !== undefined ? { extensions: paymentRequired.extensions } : {}),
       };
-      const result = await this.inflowSigner.sign(inflowMatch, context);
-      return toFoundationPayload(result.paymentPayload);
+      try {
+        const result = await this.inflowSigner.sign(inflowMatch, context);
+        const paymentPayload = toFoundationPayload(result.paymentPayload);
+        for (const hook of this.inflowAfterPaymentCreationHooks) {
+          await hook({ ...hookContext, paymentPayload });
+        }
+        return paymentPayload;
+      } catch (error) {
+        for (const hook of this.inflowPaymentCreationFailureHooks) {
+          const result = await hook({ ...hookContext, error });
+          if (result && 'recovered' in result && result.recovered) {
+            return result.payload;
+          }
+        }
+        throw error;
+      }
     }
     const payload = await super.createPaymentPayload(paymentRequired);
     // Foundation PaymentPayload is structurally assignable to InflowPaymentPayload (foundation `payload: Record<string,
@@ -187,16 +215,19 @@ export class InflowClient extends x402Client {
   }
 
   override onBeforePaymentCreation(hook: BeforePaymentCreationHook): this {
+    this.inflowBeforePaymentCreationHooks.push(hook);
     super.onBeforePaymentCreation(hook);
     return this;
   }
 
   override onAfterPaymentCreation(hook: AfterPaymentCreationHook): this {
+    this.inflowAfterPaymentCreationHooks.push(hook);
     super.onAfterPaymentCreation(hook);
     return this;
   }
 
   override onPaymentCreationFailure(hook: OnPaymentCreationFailureHook): this {
+    this.inflowPaymentCreationFailureHooks.push(hook);
     super.onPaymentCreationFailure(hook);
     return this;
   }
